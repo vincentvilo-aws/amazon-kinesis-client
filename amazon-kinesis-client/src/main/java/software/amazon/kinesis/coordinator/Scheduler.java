@@ -112,6 +112,7 @@ public class Scheduler implements Runnable {
     private static final long MIN_WAIT_TIME_FOR_LEASE_TABLE_CHECK_MILLIS = 1000L;
     private static final long MAX_WAIT_TIME_FOR_LEASE_TABLE_CHECK_MILLIS = 30 * 1000L;
     private static final long NEW_STREAM_CHECK_INTERVAL_MILLIS = 60_000L;
+    private static final long FINAL_SHUTDOWN_WAIT_TIME_SECONDS = 60L;
     private static final boolean SHOULD_DO_LEASE_SYNC_FOR_OLD_STREAMS = false;
     private static final String MULTI_STREAM_TRACKER = "MultiStreamTracker";
     private static final String ACTIVE_STREAMS_COUNT = "ActiveStreams.Count";
@@ -195,6 +196,7 @@ public class Scheduler implements Runnable {
      * CountDownLatch used by the GracefulShutdownCoordinator. Reaching zero means that
      * the scheduler's finalShutdown() call has completed.
      */
+    @Getter(AccessLevel.NONE)
     private final CountDownLatch finalShutdownLatch = new CountDownLatch(1);
 
     @VisibleForTesting
@@ -759,6 +761,13 @@ public class Scheduler implements Runnable {
 
     public boolean hasGracefulShutdownStarted() {
         return gracefuleShutdownStarted;
+    }
+
+    /**
+     * called by GracefulShutdownCoordinator to wait for the worker's final shutdown to complete
+     */
+    public boolean waitForFinalShutdown() throws InterruptedException {
+        return finalShutdownLatch.await(FINAL_SHUTDOWN_WAIT_TIME_SECONDS, TimeUnit.SECONDS);
     }
 
     @VisibleForTesting
