@@ -763,13 +763,6 @@ public class Scheduler implements Runnable {
         return gracefuleShutdownStarted;
     }
 
-    /**
-     * called by GracefulShutdownCoordinator to wait for the worker's final shutdown to complete
-     */
-    public boolean waitForFinalShutdown() throws InterruptedException {
-        return finalShutdownLatch.await(FINAL_SHUTDOWN_WAIT_TIME_SECONDS, TimeUnit.SECONDS);
-    }
-
     @VisibleForTesting
     Callable<GracefulShutdownContext> createWorkerShutdownCallable() {
         return () -> {
@@ -873,6 +866,21 @@ public class Scheduler implements Runnable {
         }
         shutdownComplete = true;
         finalShutdownLatch.countDown();
+    }
+
+    /**
+     * called by {@link GracefulShutdownCoordinator} to wait for the worker's final shutdown to complete before returning
+     * @return true if the final shutdown is successful, false otherwise.
+     */
+    boolean waitForFinalShutdown() {
+        boolean finalShutdownResult;
+        try {
+            finalShutdownResult = finalShutdownLatch.await(FINAL_SHUTDOWN_WAIT_TIME_SECONDS, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            log.warn("Final shutdown interrupted due to exception:", e);
+            return false;
+        }
+        return finalShutdownResult;
     }
 
     private List<ShardInfo> getShardInfoForAssignments() {

@@ -54,7 +54,7 @@ public class GracefulShutdownCoordinatorTest {
 
     @Before
     public void before() throws InterruptedException {
-        mockFinalShutdownLatchSucceeds();
+        mockFinalShutdownSucceeds();
     }
 
     @Test
@@ -349,7 +349,7 @@ public class GracefulShutdownCoordinatorTest {
         when(shardInfoConsumerMap.isEmpty()).thenReturn(initialItemCount == 0, additionalEmptyStates);
     }
 
-    private void mockFinalShutdownLatchSucceeds() throws InterruptedException {
+    private void mockFinalShutdownSucceeds() {
         when(scheduler.waitForFinalShutdown()).thenReturn(true);
     }
 
