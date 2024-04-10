@@ -19,10 +19,7 @@ jobs:
       - run: ls tmp
       - run: tar -xzf tmp/kinesis-client.tar.gz
       - run: ls
-      - run: | 
-          echo "Tag name from GITHUB_REF_NAME: $GITHUB_REF_NAME"
-      - run: ls
-      - run: cd amazon-kinesis-client-$GITHUB_REF_NAME
+      - run: cd amazon-kinesis-client-*
       - run: mvn clean install -Dgpg.skip=true
       - run: cd ..
       - run: mvn -B package --file pom.xml -DskipITs
