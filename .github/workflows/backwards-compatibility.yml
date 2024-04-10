@@ -1,6 +1,6 @@
-- name: release-downloader
-- uses: robinraju/release-downloader@v1.9
-  with:
+name: release-downloader
+uses: robinraju/release-downloader@v1.9
+with:
     # The source repository path.
     # Expected format {owner}/{repo}
     # Default: ${{ github.repository }}
@@ -10,6 +10,7 @@
     # The default value is 'false'
     latest: true
 
+    # Download the attached zipball (*.zip)
     zipBall: true
 
     # Relative path under $GITHUB_WORKSPACE to place the downloaded file(s)
@@ -21,4 +22,11 @@
     # Checks all downloaded files if they end with zip, tar or tar.gz and extracts them, if true.
     # Prints a warning if enabled but file is not an archive - but does not fail.
     extract: true
+on: [push]
+jobs:
+  check-directory:
+    runs-on: ubuntu-latest
+    steps:
+      - run: ls release-downloads
+      - run: rm -rf release-downloads
 
