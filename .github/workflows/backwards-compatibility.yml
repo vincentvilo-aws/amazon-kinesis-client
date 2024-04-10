@@ -18,7 +18,7 @@ jobs:
       - run: gh release download -R awslabs/amazon-kinesis-client --archive=tar.gz --output tmp/kinesis-client.tar.gz
       - run: ls tmp
       - run: tar -xzf tmp/kinesis-client.tar.gz
-      - run: RELEASE_VERSION=$(ls | grep amazon-kinesis-client | sed 's/.*-//')
+      - run: echo "RELEASE_VERSION=$(ls | grep amazon-kinesis-client | sed 's/.*-//')" >> $GITHUB_ENV
       - run: cd amazon-kinesis-client-$RELEASE_VERSION
       - run: mvn -B package --file pom.xml -DskipITs
       - run: cd ..
