@@ -12,6 +12,8 @@ on:
 jobs:
   check-directory:
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - run: gh release download -R awslabs/amazon-kinesis-client --archive=tar.gz --output downloaded-files/kinesis-client.tar.gz
       - run: ls release-downloads
