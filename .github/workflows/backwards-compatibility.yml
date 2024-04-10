@@ -13,16 +13,12 @@ jobs:
   check-directory:
     runs-on: ubuntu-latest
     steps:
-        - uses: robinraju/release-downloader@v1.9
-          with:
-                repository: "awslabs/amazon-kinesis-client"
-                latest: true
-                zipBall: true
-                tarBall: true
-                out-file-path: "release-downloads"
-                extract: true
-        - run: ls release-downloads
-        - run: rm -rf release-downloads
+      - run: gh release download -R awslabs/amazon-kinesis-client --archive=tar.gz --output downloaded-files/kinesis-client.tar.gz
+      - run: ls release-downloads
+      - run: | 
+          echo "Tag name from GITHUB_REF_NAME: $GITHUB_REF_NAME"
+      - run: rm -rf release-downloads
+      - run: ls release-downloads
 
 
 
