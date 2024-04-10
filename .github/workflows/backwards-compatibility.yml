@@ -18,6 +18,7 @@ jobs:
                 repository: "awslabs/amazon-kinesis-client"
                 latest: true
                 zipBall: true
+                tarBall: true
                 out-file-path: "release-downloads"
                 extract: true
         - run: ls release-downloads
