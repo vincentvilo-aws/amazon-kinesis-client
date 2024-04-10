@@ -20,7 +20,7 @@ jobs:
       - run: tar -xzf tmp/kinesis-client.tar.gz
       - run: ls
       - run: cd amazon-kinesis-client-*
-      - run: mvn clean install -Dgpg.skip=true
+      - run: mvn -B package --file pom.xml -DskipITs
       - run: cd ..
       - run: mvn -B package --file pom.xml -DskipITs
       - run: ls /root/.m2/repository/
