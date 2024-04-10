@@ -19,9 +19,7 @@ jobs:
       - run: ls tmp
       - run: tar -xzf tmp/kinesis-client.tar.gz
       - run: echo "RELEASE_VERSION=$(ls | grep amazon-kinesis-client | sed 's/.*-//')" >> $GITHUB_ENV
-      - run: cd amazon-kinesis-client-$RELEASE_VERSION
-      - run: mvn -B package --file pom.xml -DskipITs
-      - run: cd ..
+      - run: mvn -B package --file amazon-kinesis-client-$RELEASE_VERSION/pom.xml -DskipITs
       - run: mvn -B package --file pom.xml -DskipITs
       - run: ls /root/.m2/repository/
       - run: rm -rf tmp
