@@ -15,23 +15,24 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
+      # Get latest jar
       - run: gh release download -R awslabs/amazon-kinesis-client --archive=tar.gz --output tmp/kinesis-client.tar.gz
       - run: ls tmp
       - run: tar -xzf tmp/kinesis-client.tar.gz
       - run: echo "LATEST_RELEASE=$(ls | grep amazon-kinesis-client | sed 's/.*-//')" >> $GITHUB_ENV
+      - run: curl https://repo1.maven.org/maven2/software/amazon/kinesis/amazon-kinesis-client/$LATEST_RELEASE/amazon-kinesis-client-$LATEST_RELEASE.jar --output amazon-kinesis-client-$LATEST_RELEASE.jar
 
+      # Get current jar
       - uses: actions/checkout@v3
       - name: Set up JDK 8
         uses: actions/setup-java@v3
         with:
           java-version: '8'
           distribution: 'corretto'
-      - run: mvn -B package --file pom.xml -DskipITs
-      - run: echo "MVN_VERSION=$(mvn -q  -Dexec.executable=echo -Dexec.args='${project.version}'  --non-recursive exec:exec)" >> $GITHUB_ENV
+      - run: mvn clean install -Dgpg.skip=true -DskipITs
+      - run: echo "CURRENT_VERSION=$(mvn -q  -Dexec.executable=echo -Dexec.args='${project.version}'  --non-recursive exec:exec)" >> $GITHUB_ENV
+      - run: ls ~/.m2/repository/software/amazon/kinesis/amazon-kinesis-client/$CURRENT_VERSION
 
-      - run: curl https://repo1.maven.org/maven2/software/amazon/kinesis/amazon-kinesis-client/$LATEST_RELEASE/amazon-kinesis-client-$LATEST_RELEASE.jar --output amazon-kinesis-client-$LATEST_RELEASE.jar
-      - run: ls ~/.m2/repository/software/amazon/kinesis/amazon-kinesis-client/$MVN_VERSION
-      - run: ls ~/.m2/repository/software/amazon/kinesis/amazon-kinesis-client/$LATEST_RELEASE
       - run: rm -rf tmp
 
 
