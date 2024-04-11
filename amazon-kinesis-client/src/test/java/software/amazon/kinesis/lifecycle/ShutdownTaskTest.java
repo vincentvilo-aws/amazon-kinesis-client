@@ -384,6 +384,6 @@ public class ShutdownTaskTest {
         return new ShutdownTask(shardInfo, shardDetector, shardRecordProcessor, recordProcessorCheckpointer,
                 reason, INITIAL_POSITION_TRIM_HORIZON, false, false,
                 leaseCoordinator, TASK_BACKOFF_TIME_MILLIS, recordsPublisher, hierarchicalShardSyncer,
-                NULL_METRICS_FACTORY, childShards, STREAM_IDENTIFIER, leaseCleanupManager);
+                NULL_METRICS_FACTORY, childShards, STREAM_IDENTIFIER, leaseCleanupManager, true);
     }
 }

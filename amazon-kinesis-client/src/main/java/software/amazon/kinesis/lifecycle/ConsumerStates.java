@@ -488,7 +488,8 @@ class ConsumerStates {
                     argument.metricsFactory(),
                     input == null ? null : input.childShards(),
                     argument.streamIdentifier(),
-                    argument.leaseCleanupManager());
+                    argument.leaseCleanupManager(),
+                    true);
         }
 
         @Override
