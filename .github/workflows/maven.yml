@@ -12,6 +12,7 @@ on:
   push:
     branches:
       - "master"
+      - "clirr-plugin-test"
   pull_request:
     branches:
       - "master"

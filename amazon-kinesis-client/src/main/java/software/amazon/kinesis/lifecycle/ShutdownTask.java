@@ -109,6 +109,8 @@ public class ShutdownTask implements ConsumerTask {
     @NonNull
     private final LeaseCleanupManager leaseCleanupManager;
 
+    private final boolean testBoolean;
+
     /*
      * Invokes ShardRecordProcessor shutdown() API.
      * (non-Javadoc)
