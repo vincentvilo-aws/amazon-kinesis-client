@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/zsh
 
 TRUE=1
 FALSE=0

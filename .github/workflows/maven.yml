@@ -12,6 +12,7 @@ on:
   push:
     branches:
       - "master"
+      - "bw-compat-check-test"
   pull_request:
     branches:
       - "master"
