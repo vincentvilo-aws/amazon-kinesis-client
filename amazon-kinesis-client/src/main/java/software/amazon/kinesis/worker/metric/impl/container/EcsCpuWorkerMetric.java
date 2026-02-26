@@ -169,7 +169,15 @@ public class EcsCpuWorkerMetric implements WorkerMetric {
             }
             containersCpuShareSum += containerCpuShare;
         }
-        return ((double) currentContainerCpuShare) / containersCpuShareSum * taskCpuLimit;
+        final double calculatedLimit = ((double) currentContainerCpuShare) / containersCpuShareSum * taskCpuLimit;
+        log.info(
+                "currentContainerCpuShare = [{}], containersCpuShareSum = [{}], "
+                        + "taskCpuLimit = [{}] calculated limit = [{}]",
+                currentContainerCpuShare,
+                containersCpuShareSum,
+                taskCpuLimit,
+                calculatedLimit);
+        return calculatedLimit;
     }
 
     private double calculateTaskCpuLimit(JsonNode taskStatsRootNode, double onlineCpus) {
