@@ -164,6 +164,7 @@ public class EcsCpuWorkerMetric implements WorkerMetric {
             final JsonNode containerNode = containersIterator.next();
             final int containerCpuShare =
                     containerNode.path("Limits").path("CPU").asInt();
+            log.info("dockerId: {}", containerNode.path("DockerId").asText());
             if (containerNode.path("DockerId").asText().equals(currentContainerId)) {
                 currentContainerCpuShare = containerCpuShare;
             }
