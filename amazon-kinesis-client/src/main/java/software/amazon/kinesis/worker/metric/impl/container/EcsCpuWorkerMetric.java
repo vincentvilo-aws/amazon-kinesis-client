@@ -128,10 +128,20 @@ public class EcsCpuWorkerMetric implements WorkerMetric {
         // 2.2 which stands for 2.2 CPU cores were fully utilized. If this number is less than 1 than that means
         // that less than 1 CPU core was used.
         final double cpuCoreTimeUsed = ((double) cpuUsageDiff) / systemCpuUsageDiff * onlineCpus;
+        final double usage = Math.min(100.0, cpuCoreTimeUsed / containerCpuLimit * 100.0);
 
         // This calculated value is cpu utilization percent. This can burst past 100%, but we will take min with 100%
         // because only this amount is guaranteed CPU time to the container
-        return Math.min(100.0, cpuCoreTimeUsed / containerCpuLimit * 100.0);
+        log.info("cpuUsage = [{}], prevCpuUsage = [{}], cpuUsageDiff = [{}]", cpuUsage, prevCpuUsage, cpuUsageDiff);
+        log.info(
+                "sysCpuUsage = [{}], prevSysCpuUsage = [{}], systemCpuUsageDiff = [{}]",
+                systemCpuUsage,
+                prevSystemCpuUsage,
+                systemCpuUsageDiff);
+        log.info("cpuCoreTimeUsed = [{}], onlineCpus = [{}]", cpuCoreTimeUsed, onlineCpus);
+        log.info("containerCpuLimit = [{}], usage = [{}]", containerCpuLimit, usage);
+
+        return usage;
     }
 
     /**
