@@ -79,6 +79,12 @@ class EcsCpuWorkerMetricsTest {
         runWorkerMetricTest(testDataPath, 25D);
     }
 
+    @Test
+    void sanity_capture_twoContainerTaskWithLimitOnOneContainer() throws IOException {
+        final String testDataPath = "src/test/data/ecstestdata/twoContainerTaskWithLimitOnOneContainer";
+        runWorkerMetricTest(testDataPath, 25D);
+    }
+
     /**
      * Using the same test data as sanity_capture_taskCpuLimitOneContainer.
      */
