@@ -50,8 +50,13 @@ public class EcsCpuWorkerMetric implements WorkerMetric {
 
     private static final WorkerMetricType CPU_WORKER_METRICS_TYPE = WorkerMetricType.CPU;
     private static final String SYS_VAR_ECS_METADATA_URI = "ECS_CONTAINER_METADATA_URI_V4";
+
+    // 1 vCPU = 1024 CPU shares
     private static final double VCPU_TO_CPU_CONVERSION_FACTOR = 1024;
-    private static final double MINIMUM_CPU_THRESHOLD = 2;
+
+    // if no CPU limit is specified, the minimum value 2 is returned by the metadata endpoint
+    private static final double MINIMUM_VALID_CPU_SHARE = 2;
+
     private final OperatingRange operatingRange;
     private final String containerStatsUri;
     private final String taskMetadataUri;
@@ -111,7 +116,6 @@ public class EcsCpuWorkerMetric implements WorkerMetric {
             onlineCpus =
                     containerStatsRootNode.path("cpu_stats").path("online_cpus").asDouble();
             containerCpuLimit = calculateContainerCpuLimit(onlineCpus);
-            log.info("containerCpuLimit=[{}]", containerCpuLimit);
         }
 
         // precpu_stats values will be 0 if it is the first call
@@ -131,16 +135,22 @@ public class EcsCpuWorkerMetric implements WorkerMetric {
         // 2.2 which stands for 2.2 CPU cores were fully utilized. If this number is less than 1 than that means
         // that less than 1 CPU core was used.
         final double cpuCoreTimeUsed = ((double) cpuUsageDiff) / systemCpuUsageDiff * onlineCpus;
-        log.info("cpuCoreTimeUsed=[{}]", cpuCoreTimeUsed);
-        log.info("cpuUsageDiff=[{}]", cpuUsageDiff);
-        log.info("systemCpuUsageDiff=[{}]", systemCpuUsageDiff);
-        log.info("onlineCpus=[{}]", onlineCpus);
-        log.info("launchType=[{}]", getLaunchType());
-        log.info("containerCpuLimit=[{}]", containerCpuLimit);
 
         // This calculated value is cpu utilization percent. This can burst past 100%, but we will take min with 100%
         // because only this amount is guaranteed CPU time to the container
-        return Math.min(100.0, cpuCoreTimeUsed / containerCpuLimit * 100.0);
+        final double cpuUtilizationPercent = Math.min(100.0, cpuCoreTimeUsed / containerCpuLimit * 100.0);
+
+        log.debug("cpuUsageDiff=[{}] / systemCpuUsageDiff=[{}] * onlineCpus=[{}] = cpuCoreTimeUsed=[{}]",
+                cpuUsageDiff,
+                systemCpuUsageDiff,
+                onlineCpus,
+                cpuCoreTimeUsed);
+        log.debug("cpuCoreTimeUsed=[{}] / containerCpuLimit=[{}] * 100 = cpuUtilizationPercent=[{}]",
+                cpuCoreTimeUsed,
+                containerCpuLimit,
+                cpuUtilizationPercent);
+
+        return cpuUtilizationPercent;
     }
 
     /**
@@ -175,16 +185,16 @@ public class EcsCpuWorkerMetric implements WorkerMetric {
             containersCpuShareSum =
                     taskStatsRootNode.path("Limits").path("CPU").asDouble() * VCPU_TO_CPU_CONVERSION_FACTOR;
             currentContainerCpuShare =
-                    containerRootNode.path("Limits").path("CPU").asInt();
+                    containerRootNode.path("Limits").path("CPU").asDouble();
             // if no limit is set, use the unreserved CPU shares
-            if (currentContainerCpuShare <= 2) {
+            if (currentContainerCpuShare <= MINIMUM_VALID_CPU_SHARE) {
                 currentContainerCpuShare = getUnreservedCPUShares(containersCpuShareSum);
             }
         } else {
             while (containersIterator.hasNext()) {
                 final JsonNode containerNode = containersIterator.next();
-                final int containerCpuShare =
-                        containerNode.path("Limits").path("CPU").asInt();
+                final double containerCpuShare =
+                        containerNode.path("Limits").path("CPU").asDouble();
                 if (containerNode.path("DockerId").asText().equals(currentContainerId)) {
                     currentContainerCpuShare = containerCpuShare;
                 }
@@ -192,10 +202,6 @@ public class EcsCpuWorkerMetric implements WorkerMetric {
             }
         }
 
-        log.info("====== Cpu Limit metrics ======");
-        log.info("currentContainerCpuShare=[{}]", currentContainerCpuShare);
-        log.info("containersCpuShareSum=[{}]", containersCpuShareSum);
-        log.info("taskCpuLimit=[{}]", taskCpuLimit);
         return currentContainerCpuShare / containersCpuShareSum * taskCpuLimit;
     }
 
@@ -242,21 +248,20 @@ public class EcsCpuWorkerMetric implements WorkerMetric {
     }
 
     private double getUnreservedCPUShares(final double taskCPULimit) {
-        int reservedCPUShares = 0;
+        double reservedCPUShares = 0;
         final JsonNode taskStatsRootNode = readEcsMetadata(taskMetadataUri);
         for (JsonNode containerNode : taskStatsRootNode.path("Containers")) {
-            final int containerCpuShare =
-                    containerNode.path("Limits").path("CPU").asInt();
+            final double containerCpuShare =
+                    containerNode.path("Limits").path("CPU").asDouble();
             if (isCPULimitSetForContainer(containerCpuShare)) {
                 reservedCPUShares += containerCpuShare;
             }
         }
-        log.info("taskCPULimit=[{}], reservedCPUShares = [{}]", taskCPULimit, reservedCPUShares);
         return taskCPULimit - reservedCPUShares;
     }
 
-    private boolean isCPULimitSetForContainer(final int cpuLimit) {
-        return cpuLimit > MINIMUM_CPU_THRESHOLD;
+    private boolean isCPULimitSetForContainer(final double cpuLimit) {
+        return cpuLimit > MINIMUM_VALID_CPU_SHARE;
     }
 
     @Override
