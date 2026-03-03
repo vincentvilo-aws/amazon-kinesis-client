@@ -162,7 +162,7 @@
   "storage_stats": {},
   "cpu_stats": {
     "cpu_usage": {
-      "total_usage": 19903832617,
+      "total_usage": 150000000,
       "percpu_usage": [
         5273912276,
         4300592289,
@@ -172,8 +172,8 @@
       "usage_in_kernelmode": 1230000000,
       "usage_in_usermode": 17620000000
     },
-    "system_cpu_usage": 3938370000000,
-    "online_cpus": 4,
+    "system_cpu_usage": 200000000,
+    "online_cpus": 6,
     "throttling_data": {
       "periods": 0,
       "throttled_periods": 0,
@@ -182,7 +182,7 @@
   },
   "precpu_stats": {
     "cpu_usage": {
-      "total_usage": 19834394160,
+      "total_usage": 100000000,
       "percpu_usage": [
         5259338019,
         4275853372,
@@ -192,7 +192,7 @@
       "usage_in_kernelmode": 1220000000,
       "usage_in_usermode": 17600000000
     },
-    "system_cpu_usage": 3898490000000,
+    "system_cpu_usage": 100000000,
     "online_cpus": 4,
     "throttling_data": {
       "periods": 0,

@@ -6,7 +6,7 @@
   "DesiredStatus": "RUNNING",
   "KnownStatus": "RUNNING",
   "Limits": {
-    "CPU": 4,
+    "CPU": 6,
     "Memory": 30720
   },
   "PullStartedAt": "2026-03-02T18:36:32.086126227Z",
@@ -30,7 +30,7 @@
       "DesiredStatus": "RUNNING",
       "KnownStatus": "RUNNING",
       "Limits": {
-        "CPU": 512
+        "CPU": 1024
       },
       "CreatedAt": "2026-03-02T18:36:40.40467597Z",
       "StartedAt": "2026-03-02T18:36:40.40467597Z",
