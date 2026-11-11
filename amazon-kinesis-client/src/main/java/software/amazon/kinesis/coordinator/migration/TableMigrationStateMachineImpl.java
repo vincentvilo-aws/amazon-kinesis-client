@@ -15,9 +15,13 @@
 package software.amazon.kinesis.coordinator.migration;
 
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -43,6 +47,7 @@ import software.amazon.kinesis.metrics.MetricsFactory;
 import software.amazon.kinesis.metrics.MetricsLevel;
 import software.amazon.kinesis.metrics.MetricsScope;
 import software.amazon.kinesis.metrics.MetricsUtil;
+import software.amazon.kinesis.segmenting.LeaderVersionState;
 
 import static software.amazon.kinesis.worker.metricstats.WorkerMetricStats.Features.SINGLE_TABLE_MIGRATION;
 
@@ -908,6 +913,28 @@ public class TableMigrationStateMachineImpl implements TableMigrationStateMachin
     private static final int TRANSACTION_BATCH_SIZE = 25;
 
     /**
+     * Leader items that the batched move and the legacy emptiness check leave alone:
+     * <ul>
+     *   <li>The {@code Leader} and {@code DeployingLeader} locks are live locks held through the legacy table's lock
+     *       client. Moving one would delete it from under its holder. They stay in legacy; after COMPLETE each
+     *       holder's lock client switches to the lease table and acquires there.</li>
+     *   <li>The {@code LeaderVersion} and {@code DeployingLeaderVersion} items are refreshed by their lock holders
+     *       and can be recreated in legacy at any time (e.g. by a worker rolled back to phase 1). Moving them in a
+     *       batch could leave a copy in each table, after which every retry of the move fails its conditional put.
+     *       They are moved in the COMPLETE transaction instead; see {@link #finalizeMigrationComplete}.</li>
+     * </ul>
+     */
+    private static final Set<String> LEADER_ITEM_KEYS = Collections.unmodifiableSet(new HashSet<>(Arrays.asList(
+            LeaderLock.LEADER_HASH_KEY,
+            LeaderLock.DEPLOYING_LEADER_HASH_KEY,
+            LeaderVersionState.LEADER_VERSION_HASH_KEY,
+            LeaderVersionState.DEPLOYING_LEADER_VERSION_HASH_KEY)));
+
+    /** Leader version items, moved from legacy to the lease table in the COMPLETE transaction. */
+    private static final List<String> LEADER_VERSION_KEYS = Collections.unmodifiableList(Arrays.asList(
+            LeaderVersionState.LEADER_VERSION_HASH_KEY, LeaderVersionState.DEPLOYING_LEADER_VERSION_HASH_KEY));
+
+    /**
      * Moves all coordinator state entries from the legacy table to the lease table in
      * transactional batches. Each batch atomically writes entries to the lease table
      * (conditional on not already existing) and deletes them from the legacy table.
@@ -917,7 +944,9 @@ public class TableMigrationStateMachineImpl implements TableMigrationStateMachin
      *
      * <p>Entries excluded from the move:</p>
      * <ul>
-     *   <li>Lock entry (LEADER_HASH_KEY) — remain in legacy</li>
+     *   <li>Leader locks ({@code Leader}, {@code DeployingLeader}) — remain in legacy</li>
+     *   <li>Leader version items ({@code LeaderVersion}, {@code DeployingLeaderVersion}) — moved in the COMPLETE
+     *       transaction (see {@link #LEADER_ITEM_KEYS})</li>
      *   <li>TableMigrationState entry — written separately with COMPLETE status</li>
      * </ul>
      *
@@ -947,9 +976,9 @@ public class TableMigrationStateMachineImpl implements TableMigrationStateMachin
             final List<CoordinatorState> entriesToMove = new ArrayList<>();
 
             for (final CoordinatorState entry : legacyEntries) {
-                // Skip lock entries — they are not migrated
-                if (LeaderLock.LEADER_HASH_KEY.equals(entry.getKey())) {
-                    log.debug("Skipping lock entry: {}", entry.getKey());
+                // Skip the leader locks and leader version items; see LEADER_ITEM_KEYS.
+                if (LEADER_ITEM_KEYS.contains(entry.getKey())) {
+                    log.debug("Skipping leader entry: {}", entry.getKey());
                     continue;
                 }
                 // Skip the migration state itself — it will be written separately with COMPLETE status
@@ -1057,6 +1086,10 @@ public class TableMigrationStateMachineImpl implements TableMigrationStateMachin
      *   <li>Creates the TableMigrationState with COMPLETE status in the lease table
      *       and Updates the existing state in the legacy table to COMPLETE
      *       (conditional on the previous status still being PENDING) transactionally.</li>
+     *   <li>In the same transaction, moves the leader version items from legacy to the lease table, so the
+     *       current leader's version is in the lease table the moment COMPLETE becomes visible. Otherwise every
+     *       worker would briefly see no version, contend for {@code Leader}, and a worker on a deploying version
+     *       could take it and make its version current.</li>
      *   <li>Updates the {@link TableMigrationStatusProvider} to COMPLETE.</li>
      *   <li>Throws {@link InvalidStateException} to release the lock.</li>
      * </ol>
@@ -1073,9 +1106,21 @@ public class TableMigrationStateMachineImpl implements TableMigrationStateMachin
         final TableMigrationState updatedLegacy =
                 existingState.update(TableMigrationStatus.TABLE_MIGRATION_STATUS_COMPLETE, workerId);
 
+        // Leader version items to move with COMPLETE. Read before building the transaction; a version item updated
+        // by its holder after this read is at most one heartbeat stale in the lease table, and the holder
+        // overwrites it on its next heartbeat.
+        final List<CoordinatorState> versionItems;
+        try {
+            versionItems = readLegacyLeaderVersionItems();
+        } catch (final DependencyException | InvalidStateException | ProvisionedThroughputException e) {
+            scope.addData(COMPLETION_FAULT_METRIC, 1, StandardUnit.COUNT, MetricsLevel.SUMMARY);
+            log.warn("Failed to read leader version items before writing COMPLETE. Will retry next cycle.", e);
+            return;
+        }
+
         // Atomically write COMPLETE to both the lease table (conditional create) and legacy table
         // (conditional on current status being PENDING). This ensures both are set together.
-        final List<TransactWriteItem> transactItems = new ArrayList<>(3);
+        final List<TransactWriteItem> transactItems = new ArrayList<>(3 + 2 * versionItems.size());
 
         // Leader fencing: assert we still own the lock
         transactItems.add(createLockOwnerConditionCheck());
@@ -1096,6 +1141,13 @@ public class TableMigrationStateMachineImpl implements TableMigrationStateMachin
                 .build();
         transactItems.add(TransactWriteItem.builder().put(legacyPut).build());
 
+        // Move the leader version items. The put overwrites any copy already in the lease table, since a copy
+        // there can only be older than the one in legacy.
+        for (final CoordinatorState versionItem : versionItems) {
+            transactItems.add(leaseTableDao.createTransactOverwritePut(versionItem));
+            transactItems.add(legacyDao.createTransactDelete(versionItem.getKey()));
+        }
+
         try {
             coordinatorStateDAO.executeTransactWrite(transactItems);
             log.info("Transactionally wrote COMPLETE to both lease table and legacy table.");
@@ -1108,8 +1160,9 @@ public class TableMigrationStateMachineImpl implements TableMigrationStateMachin
         }
 
         // Update status provider
-        // Note: entries were already deleted from legacy during the transactional move.
-        // The legacy table now only contains the lock entry and the TableMigrationState (COMPLETE).
+        // Note: entries were already deleted from legacy during the transactional move, and the leader version
+        // items in the COMPLETE transaction. The legacy table now only contains the leader locks and the
+        // TableMigrationState (COMPLETE).
         statusProvider.updateTableMigrationStatus(TableMigrationStatus.TABLE_MIGRATION_STATUS_COMPLETE);
 
         log.info(
@@ -1119,6 +1172,19 @@ public class TableMigrationStateMachineImpl implements TableMigrationStateMachin
         // The next isLeader check will use the COMPLETE status to acquire lock from lease table.
         throw new InvalidStateException(
                 "Table migration completed. Release legacy lock so lease table lock can be acquired.");
+    }
+
+    /** Reads the leader version items present in the legacy table. */
+    private List<CoordinatorState> readLegacyLeaderVersionItems()
+            throws DependencyException, InvalidStateException, ProvisionedThroughputException {
+        final List<CoordinatorState> items = new ArrayList<>(LEADER_VERSION_KEYS.size());
+        for (final String key : LEADER_VERSION_KEYS) {
+            final CoordinatorState item = legacyDao.getCoordinatorState(key);
+            if (item != null) {
+                items.add(item);
+            }
+        }
+        return items;
     }
 
     // ==================== Migration Stats Consumer ====================
@@ -1159,8 +1225,8 @@ public class TableMigrationStateMachineImpl implements TableMigrationStateMachin
 
     /**
      * Returns true when the legacy coordinator state table contains only the expected
-     * entries that are not moved: the leader lock, deploying leader lock, and the
-     * TableMigrationState entry. Any other entries indicate the async move did not
+     * entries that are not moved in batches: the leader locks, the leader version items
+     * (see {@link #LEADER_ITEM_KEYS}), and the TableMigrationState entry. Any other entries indicate the async move did not
      * fully complete or new entries were written concurrently.
      *
      * <p>This is called after the async move reports success to confirm the legacy table
@@ -1171,8 +1237,7 @@ public class TableMigrationStateMachineImpl implements TableMigrationStateMachin
             final List<CoordinatorState> entries = legacyDao.listCoordinatorState();
             for (final CoordinatorState entry : entries) {
                 final String key = entry.getKey();
-                if (LeaderLock.LEADER_HASH_KEY.equals(key)
-                        || TableMigrationState.TABLE_MIGRATION_HASH_KEY.equals(key)) {
+                if (LEADER_ITEM_KEYS.contains(key) || TableMigrationState.TABLE_MIGRATION_HASH_KEY.equals(key)) {
                     continue;
                 }
                 // Found an unexpected entry — legacy is not empty.

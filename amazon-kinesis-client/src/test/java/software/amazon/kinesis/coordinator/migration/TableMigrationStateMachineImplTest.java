@@ -17,6 +17,7 @@ package software.amazon.kinesis.coordinator.migration;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import com.amazonaws.services.dynamodbv2.local.embedded.DynamoDBEmbedded;
 import com.amazonaws.services.dynamodbv2.local.shared.access.AmazonDynamoDBLocal;
@@ -36,11 +37,14 @@ import software.amazon.awssdk.services.dynamodb.model.ScalarAttributeType;
 import software.amazon.kinesis.coordinator.CoordinatorConfig;
 import software.amazon.kinesis.coordinator.CoordinatorConfig.CoordinatorStateTableConfig;
 import software.amazon.kinesis.coordinator.CoordinatorStateDAO;
+import software.amazon.kinesis.leader.LeaderLock;
 import software.amazon.kinesis.leases.LeaseManagementConfig;
 import software.amazon.kinesis.leases.exceptions.InvalidStateException;
 import software.amazon.kinesis.metrics.NullMetricsFactory;
+import software.amazon.kinesis.segmenting.LeaderVersionState;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -953,16 +957,290 @@ class TableMigrationStateMachineImplTest {
                 "State should still exist — counter was reset on leader change");
     }
 
+    // --- Leader items during the move and the COMPLETE transaction ---
+
+    private static final String OTHER_ENTRY_KEY = "tmsm-other-entry";
+
+    /** Leader locks and version items stay in legacy through the batched move; other entries are moved. */
+    @Test
+    void asyncMove_leavesLeaderLocksAndVersionItemsInLegacy() throws Exception {
+        cleanLeaderItems();
+        putTableMigrationState(TableMigrationStatus.TABLE_MIGRATION_STATUS_DEPLOYED);
+        putLeaderLock(LeaderLock.LEADER_HASH_KEY, WORKER_ID);
+        putLeaderLock(LeaderLock.DEPLOYING_LEADER_HASH_KEY, "deploying-worker");
+        putVersionItem(LEGACY_TABLE, "key", LeaderVersionState.LEADER_VERSION_HASH_KEY, WORKER_ID, "0", 1000L);
+        putVersionItem(
+                LEGACY_TABLE,
+                "key",
+                LeaderVersionState.DEPLOYING_LEADER_VERSION_HASH_KEY,
+                "deploying-worker",
+                "1",
+                1000L);
+        putOtherEntry(LEGACY_TABLE, "key");
+
+        final TableMigrationStateMachineImpl sm = phase2LeaderWithLegacyMetricsEmpty();
+
+        sm.handleLeaderLockResult(true); // starts the async move
+        waitForMoveAndWritePending(sm);
+
+        // The other entry was moved.
+        assertTrue(isEmpty(getItem(LEGACY_TABLE, "key", OTHER_ENTRY_KEY)));
+        assertFalse(isEmpty(getItem(LEASE_TABLE, "leaseKey", OTHER_ENTRY_KEY)));
+        // The leader items were not.
+        for (final String key : LEADER_KEYS) {
+            assertFalse(isEmpty(getItem(LEGACY_TABLE, "key", key)), key + " left legacy");
+            assertTrue(isEmpty(getItem(LEASE_TABLE, "leaseKey", key)), key + " was moved to the lease table");
+        }
+        // And the move counted as complete: DDB advanced to PENDING.
+        assertEquals(
+                TableMigrationStatus.TABLE_MIGRATION_STATUS_PENDING.name(),
+                getItem(LEGACY_TABLE, "key", TableMigrationState.TABLE_MIGRATION_HASH_KEY)
+                        .get(TableMigrationState.TABLE_MIGRATION_STATUS_ATTRIBUTE_NAME)
+                        .s());
+        sm.shutdown();
+    }
+
+    /**
+     * A copy of a version item already in the lease table (e.g. from an earlier move attempt before a phase 2
+     * rollback) does not block the move: version items are not part of it.
+     */
+    @Test
+    void asyncMove_succeedsWhenVersionItemAlsoInLeaseTable() throws Exception {
+        cleanLeaderItems();
+        putTableMigrationState(TableMigrationStatus.TABLE_MIGRATION_STATUS_DEPLOYED);
+        putLeaderLock(LeaderLock.LEADER_HASH_KEY, WORKER_ID);
+        putVersionItem(LEGACY_TABLE, "key", LeaderVersionState.LEADER_VERSION_HASH_KEY, WORKER_ID, "0", 2000L);
+        putVersionItem(LEASE_TABLE, "leaseKey", LeaderVersionState.LEADER_VERSION_HASH_KEY, "old-worker", "0", 1000L);
+        putOtherEntry(LEGACY_TABLE, "key");
+
+        final TableMigrationStateMachineImpl sm = phase2LeaderWithLegacyMetricsEmpty();
+        sm.handleLeaderLockResult(true);
+        waitForMoveAndWritePending(sm);
+
+        assertTrue(isEmpty(getItem(LEGACY_TABLE, "key", OTHER_ENTRY_KEY)));
+        assertEquals(
+                TableMigrationStatus.TABLE_MIGRATION_STATUS_PENDING.name(),
+                getItem(LEGACY_TABLE, "key", TableMigrationState.TABLE_MIGRATION_HASH_KEY)
+                        .get(TableMigrationState.TABLE_MIGRATION_STATUS_ATTRIBUTE_NAME)
+                        .s());
+        sm.shutdown();
+    }
+
+    /**
+     * The COMPLETE transaction moves the version items to the lease table (overwriting any older copy) and leaves
+     * the locks in legacy.
+     */
+    @Test
+    void finalizeComplete_movesVersionItemsAndLeavesLocks() throws Exception {
+        cleanLeaderItems();
+        putTableMigrationState(
+                TableMigrationStatus.TABLE_MIGRATION_STATUS_PENDING,
+                System.currentTimeMillis() - TimeUnit.DAYS.toMillis(8));
+        putLeaderLock(LeaderLock.LEADER_HASH_KEY, WORKER_ID);
+        putLeaderLock(LeaderLock.DEPLOYING_LEADER_HASH_KEY, "deploying-worker");
+        putVersionItem(LEGACY_TABLE, "key", LeaderVersionState.LEADER_VERSION_HASH_KEY, WORKER_ID, "0", 2000L);
+        putVersionItem(
+                LEGACY_TABLE,
+                "key",
+                LeaderVersionState.DEPLOYING_LEADER_VERSION_HASH_KEY,
+                "deploying-worker",
+                "1",
+                2000L);
+        // An older copy in the lease table is overwritten.
+        putVersionItem(LEASE_TABLE, "leaseKey", LeaderVersionState.LEADER_VERSION_HASH_KEY, "old-worker", "0", 1000L);
+
+        final TableMigrationStateMachineImpl sm = phase2LeaderWithLegacyMetricsEmpty();
+
+        // Writing COMPLETE throws InvalidStateException so the caller releases the legacy lock.
+        assertThrows(InvalidStateException.class, () -> sm.handleLeaderLockResult(true));
+        assertEquals(TableMigrationStatus.TABLE_MIGRATION_STATUS_COMPLETE, statusProvider.getTableMigrationStatus());
+
+        final Map<String, AttributeValue> leaderVersion =
+                getItem(LEASE_TABLE, "leaseKey", LeaderVersionState.LEADER_VERSION_HASH_KEY);
+        assertEquals(
+                WORKER_ID,
+                leaderVersion.get(LeaderVersionState.OWNER_NAME_ATTRIBUTE_NAME).s());
+        assertEquals(
+                "2000",
+                leaderVersion.get(LeaderVersionState.HEARTBEAT_ATTRIBUTE_NAME).n());
+        assertEquals("LEADER", leaderVersion.get("entityType").s());
+        final Map<String, AttributeValue> deployingVersion =
+                getItem(LEASE_TABLE, "leaseKey", LeaderVersionState.DEPLOYING_LEADER_VERSION_HASH_KEY);
+        assertEquals(
+                "1",
+                deployingVersion
+                        .get(LeaderVersionState.VERSION_HASH_ATTRIBUTE_NAME)
+                        .s());
+
+        assertTrue(isEmpty(getItem(LEGACY_TABLE, "key", LeaderVersionState.LEADER_VERSION_HASH_KEY)));
+        assertTrue(isEmpty(getItem(LEGACY_TABLE, "key", LeaderVersionState.DEPLOYING_LEADER_VERSION_HASH_KEY)));
+        assertFalse(isEmpty(getItem(LEGACY_TABLE, "key", LeaderLock.LEADER_HASH_KEY)));
+        assertFalse(isEmpty(getItem(LEGACY_TABLE, "key", LeaderLock.DEPLOYING_LEADER_HASH_KEY)));
+        assertTrue(isEmpty(getItem(LEASE_TABLE, "leaseKey", LeaderLock.DEPLOYING_LEADER_HASH_KEY)));
+        sm.shutdown();
+    }
+
+    /** With no version items (segmenting not in use), COMPLETE is written as before. */
+    @Test
+    void finalizeComplete_withoutVersionItems() throws Exception {
+        cleanLeaderItems();
+        putTableMigrationState(
+                TableMigrationStatus.TABLE_MIGRATION_STATUS_PENDING,
+                System.currentTimeMillis() - TimeUnit.DAYS.toMillis(8));
+        putLeaderLock(LeaderLock.LEADER_HASH_KEY, WORKER_ID);
+
+        final TableMigrationStateMachineImpl sm = phase2LeaderWithLegacyMetricsEmpty();
+
+        assertThrows(InvalidStateException.class, () -> sm.handleLeaderLockResult(true));
+        assertEquals(TableMigrationStatus.TABLE_MIGRATION_STATUS_COMPLETE, statusProvider.getTableMigrationStatus());
+        assertTrue(isEmpty(getItem(LEASE_TABLE, "leaseKey", LeaderVersionState.LEADER_VERSION_HASH_KEY)));
+        sm.shutdown();
+    }
+
+    /** A version item recreated in legacy during PENDING does not count as a rollback. */
+    @Test
+    void pending_versionItemInLegacy_doesNotRollBack() throws Exception {
+        cleanLeaderItems();
+        putTableMigrationState(TableMigrationStatus.TABLE_MIGRATION_STATUS_PENDING);
+        putLeaderLock(LeaderLock.LEADER_HASH_KEY, WORKER_ID);
+        putVersionItem(LEGACY_TABLE, "key", LeaderVersionState.LEADER_VERSION_HASH_KEY, WORKER_ID, "0", 1000L);
+
+        final TableMigrationStateMachineImpl sm = phase2LeaderWithLegacyMetricsEmpty();
+        sm.handleLeaderLockResult(true); // still baking
+
+        assertEquals(
+                TableMigrationStatus.TABLE_MIGRATION_STATUS_PENDING.name(),
+                getItem(LEGACY_TABLE, "key", TableMigrationState.TABLE_MIGRATION_HASH_KEY)
+                        .get(TableMigrationState.TABLE_MIGRATION_STATUS_ATTRIBUTE_NAME)
+                        .s());
+        sm.shutdown();
+    }
+
+    private static final String[] LEADER_KEYS = {
+        LeaderLock.LEADER_HASH_KEY,
+        LeaderLock.DEPLOYING_LEADER_HASH_KEY,
+        LeaderVersionState.LEADER_VERSION_HASH_KEY,
+        LeaderVersionState.DEPLOYING_LEADER_VERSION_HASH_KEY
+    };
+
+    /** A phase 2 leader whose fleet writes worker metrics only to the lease table. */
+    private TableMigrationStateMachineImpl phase2LeaderWithLegacyMetricsEmpty() throws Exception {
+        final TableMigrationStateMachineImpl sm = new TableMigrationStateMachineImpl(
+                statusProvider,
+                createCoordinatorStateDAO(),
+                WORKER_ID,
+                createCoordinatorConfig(true),
+                new NullMetricsFactory(),
+                Executors.newSingleThreadExecutor());
+        sm.initialize();
+        assertEquals(TableMigrationStatus.TABLE_MIGRATION_STATUS_PENDING, statusProvider.getTableMigrationStatus());
+        sm.updateMigrationSummary(TableMigrationSummary.builder()
+                .minSupportCode(1)
+                .workersWithUnexpiredLeases(2)
+                .totalWorkersWithLeases(2)
+                .totalActiveWorkersWithMetrics(2)
+                .leaseOwnersWithActiveMetrics(2)
+                .activeWorkersWithMetricsInLeaseTable(2)
+                .activeWorkersWithMetricsInLegacyTable(0)
+                .build());
+        return sm;
+    }
+
+    /** Calls handleLeaderLockResult until the async move has finished and DDB moved to PENDING. */
+    private void waitForMoveAndWritePending(final TableMigrationStateMachineImpl sm) throws Exception {
+        final long deadline = System.currentTimeMillis() + 10_000L;
+        while (System.currentTimeMillis() < deadline) {
+            Thread.sleep(50);
+            sm.handleLeaderLockResult(true);
+            final Map<String, AttributeValue> state =
+                    getItem(LEGACY_TABLE, "key", TableMigrationState.TABLE_MIGRATION_HASH_KEY);
+            if (TableMigrationStatus.TABLE_MIGRATION_STATUS_PENDING
+                    .name()
+                    .equals(state.get(TableMigrationState.TABLE_MIGRATION_STATUS_ATTRIBUTE_NAME)
+                            .s())) {
+                return;
+            }
+        }
+        throw new AssertionError("Async move did not complete and write PENDING within 10s");
+    }
+
+    private void cleanLeaderItems() {
+        for (final String key : LEADER_KEYS) {
+            deleteItem(LEGACY_TABLE, "key", key);
+            deleteItem(LEASE_TABLE, "leaseKey", key);
+        }
+        deleteItem(LEGACY_TABLE, "key", OTHER_ENTRY_KEY);
+        deleteItem(LEASE_TABLE, "leaseKey", OTHER_ENTRY_KEY);
+    }
+
+    private void putLeaderLock(final String key, final String owner) {
+        final Map<String, AttributeValue> item = new HashMap<>();
+        item.put("key", AttributeValue.fromS(key));
+        item.put("ownerName", AttributeValue.fromS(owner));
+        item.put("leaseDuration", AttributeValue.fromS("120000"));
+        item.put("recordVersionNumber", AttributeValue.fromS("rvn-" + owner));
+        put(LEGACY_TABLE, item);
+    }
+
+    private void putVersionItem(
+            final String table,
+            final String keyAttr,
+            final String key,
+            final String owner,
+            final String versionHash,
+            final long heartbeat) {
+        final Map<String, AttributeValue> item =
+                new HashMap<>(new LeaderVersionState(key, versionHash, owner, heartbeat).serialize());
+        item.put(keyAttr, AttributeValue.fromS(key));
+        put(table, item);
+    }
+
+    private void putOtherEntry(final String table, final String keyAttr) {
+        final Map<String, AttributeValue> item = new HashMap<>();
+        item.put(keyAttr, AttributeValue.fromS(OTHER_ENTRY_KEY));
+        item.put("someAttribute", AttributeValue.fromS("value"));
+        put(table, item);
+    }
+
+    private void put(final String table, final Map<String, AttributeValue> item) {
+        try {
+            ddbClient.putItem(b -> b.tableName(table).item(item)).get();
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private Map<String, AttributeValue> getItem(final String table, final String keyAttr, final String key) {
+        try {
+            final Map<String, AttributeValue> k = new HashMap<>();
+            k.put(keyAttr, AttributeValue.fromS(key));
+            return ddbClient
+                    .getItem(b -> b.tableName(table).key(k).consistentRead(true))
+                    .get()
+                    .item();
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    private static boolean isEmpty(final Map<String, AttributeValue> item) {
+        return item == null || item.isEmpty();
+    }
+
     // --- Helpers ---
 
     private void putTableMigrationState(TableMigrationStatus status) {
+        putTableMigrationState(status, System.currentTimeMillis());
+    }
+
+    private void putTableMigrationState(TableMigrationStatus status, long modifiedTimestamp) {
         Map<String, AttributeValue> item = new HashMap<>();
         item.put("key", AttributeValue.fromS(TableMigrationState.TABLE_MIGRATION_HASH_KEY));
         item.put(TableMigrationState.TABLE_MIGRATION_STATUS_ATTRIBUTE_NAME, AttributeValue.fromS(status.name()));
         item.put(TableMigrationState.MODIFIED_BY_ATTRIBUTE_NAME, AttributeValue.fromS(WORKER_ID));
         item.put(
                 TableMigrationState.MODIFIED_TIMESTAMP_ATTRIBUTE_NAME,
-                AttributeValue.fromN(String.valueOf(System.currentTimeMillis())));
+                AttributeValue.fromN(String.valueOf(modifiedTimestamp)));
         try {
             ddbClient.putItem(b -> b.tableName(LEGACY_TABLE).item(item)).get();
         } catch (Exception e) {

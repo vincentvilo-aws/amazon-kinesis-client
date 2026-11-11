@@ -545,6 +545,19 @@ public abstract class CoordinatorStateDAODelegate {
     }
 
     /**
+     * Creates a {@link TransactWriteItem} that puts the given coordinator state into this delegate's table,
+     * replacing any existing entry with the same key.
+     *
+     * @param state the coordinator state to put
+     * @return a TransactWriteItem for use in a DynamoDB TransactWriteItems call
+     */
+    public TransactWriteItem createTransactOverwritePut(final CoordinatorState state) {
+        final Put put =
+                Put.builder().tableName(tableName).item(toDynamoRecord(state)).build();
+        return TransactWriteItem.builder().put(put).build();
+    }
+
+    /**
      * Creates a {@link TransactWriteItem} that deletes the entry with the given key
      * from this delegate's table.
      *
