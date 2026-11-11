@@ -58,8 +58,15 @@ import software.amazon.kinesis.leases.exceptions.ProvisionedThroughputException;
  * <h2>Write Logic</h2>
  * <ul>
  *   <li>cache table migration startup upon initialize(). </li>
- *   <li>If cachedStatus == COMPLETE or PENDING: write to lease table only.</li>
- *   <li>If cachedStatus == INIT or DEPLOYED: write to legacy table only.</li>
+ *   <li>Creates: if the live status is COMPLETE, write to the lease table. Otherwise write to the table chosen by
+ *       cachedStatus (COMPLETE or PENDING: lease table; INIT or DEPLOYED: legacy table), but only if the entry
+ *       does not already exist in the other table, so an entry is never created in both.</li>
+ *   <li>Updates go to the table that holds the entry: the lease table once the live status is COMPLETE, otherwise
+ *       the legacy table if the entry is there (matching the read order), else the lease table.</li>
+ *   <li>Writes that must stay next to the leader lock (the leader version items) use
+ *       {@link #createCoordinatorStateIfNotExistsInLockTable} and
+ *       {@link #updateCoordinatorStateWithExpectationInLockTable}, which follow the live status exactly like
+ *       {@link #getDDBLockClient()}.</li>
  * </ul>
  *
  * The difference between read and write are:
@@ -96,17 +103,9 @@ import software.amazon.kinesis.leases.exceptions.ProvisionedThroughputException;
  * {@link TableMigrationStateMachine.handleLeaderLockResult}
  *
  * <h2>TODO</h2>
- * Update and delete operations currently route based on the table migration status which may not
- * match where the entry was originally read from. If a caller reads from legacy but the status
- * transitions to PENDING/COMPLETE before the update, the update targets the lease table where
- * the entry may not yet exist. Consider tracking read-source per entry and routing to the
- * appropriate delegate based on the source. For now, the routing is best-effort and
- * callers that perform read-then-update must handle conditional check failures gracefully.
- * There is no usecase for an update coordinator state except for the migration state and
- * table migration state. Table Migration state is always updated from state machine using
- * appropriate delegate class directly and never through this DOA.
- * For more details refer to TableMigrationStateMachine.
- * And for migration state the assumption is both state machines are not running concurrently.
+ * Delete operations still route by cachedStatus, which may not match where the entry lives. Table Migration
+ * state is always updated from the state machine using the appropriate delegate directly and never through this
+ * DAO. For more details refer to TableMigrationStateMachine.
  */
 @Slf4j
 @KinesisClientInternalApi
@@ -275,7 +274,22 @@ public class CoordinatorStateDAO {
     public boolean createCoordinatorStateIfNotExists(@NonNull final CoordinatorState state)
             throws DependencyException, InvalidStateException, ProvisionedThroughputException {
         ensureInitialized();
-        return getWriteDelegate().createCoordinatorStateIfNotExists(state);
+        if (isTableMigrationComplete()) {
+            // COMPLETE is terminal and reads use only the lease table, so create there even if this worker
+            // initialized before COMPLETE.
+            return leaseTableDaoDelegate.createCoordinatorStateIfNotExists(state);
+        }
+        final CoordinatorStateDAODelegate writeDelegate = getWriteDelegate();
+        final CoordinatorStateDAODelegate otherDelegate =
+                writeDelegate == leaseTableDaoDelegate ? legacyTableDaoDelegate : leaseTableDaoDelegate;
+        // Before COMPLETE the entry may already be in the other table (written by a worker in the other phase, or
+        // moved by the table migration). Creating it again would leave two copies. The legacy delegate returns
+        // null when the legacy table does not exist.
+        if (otherDelegate.getCoordinatorState(state.getKey()) != null) {
+            log.info("Not creating coordinator state {} because it already exists in the other table", state.getKey());
+            return false;
+        }
+        return writeDelegate.createCoordinatorStateIfNotExists(state);
     }
 
     /**
@@ -292,9 +306,52 @@ public class CoordinatorStateDAO {
             @NonNull final CoordinatorState state, final Map<String, ExpectedAttributeValue> expectations)
             throws DependencyException, InvalidStateException, ProvisionedThroughputException {
         ensureInitialized();
-        // TODO: Update routing may not match where the entry was read from if status changed.
-        // Callers must handle conditional check failures and retry.
-        return getWriteDelegate().updateCoordinatorStateWithExpectation(state, expectations);
+        if (isTableMigrationComplete()) {
+            return leaseTableDaoDelegate.updateCoordinatorStateWithExpectation(state, expectations);
+        }
+        // Before COMPLETE the entry may be in either table, depending on which phase wrote it and whether the table
+        // migration has moved it. Update it where it is. Legacy is tried first, matching the read order.
+        if (legacyTableDaoDelegate.isEnabled()) {
+            if (legacyTableDaoDelegate.updateCoordinatorStateWithExpectation(state, expectations)) {
+                return true;
+            }
+            // The update failed: either the entry is in legacy and an expectation was not met, or it is not in
+            // legacy. Only the second case moves on to the lease table.
+            if (legacyTableDaoDelegate.getCoordinatorState(state.getKey()) != null) {
+                return false;
+            }
+        }
+        return leaseTableDaoDelegate.updateCoordinatorStateWithExpectation(state, expectations);
+    }
+
+    /**
+     * Create a coordinator state if it does not already exist, in the table that holds the leader locks: the lease
+     * table once the live status is COMPLETE, the legacy table otherwise. Used for state that must stay next to the
+     * lock it describes (the leader version items), so it follows {@link #getDDBLockClient()} rather than the
+     * status cached at initialization.
+     *
+     * @param state the state to create
+     * @return true if created, false if the key already exists in that table
+     */
+    public boolean createCoordinatorStateIfNotExistsInLockTable(@NonNull final CoordinatorState state)
+            throws DependencyException, InvalidStateException, ProvisionedThroughputException {
+        ensureInitialized();
+        return getLockTableDelegate().createCoordinatorStateIfNotExists(state);
+    }
+
+    /**
+     * Update a coordinator state with expectations in the table that holds the leader locks. See
+     * {@link #createCoordinatorStateIfNotExistsInLockTable}.
+     *
+     * @param state the state to update
+     * @param expectations conditional expectations for the update
+     * @return true if updated, false if the entry is missing from that table or expectations are not met
+     */
+    public boolean updateCoordinatorStateWithExpectationInLockTable(
+            @NonNull final CoordinatorState state, final Map<String, ExpectedAttributeValue> expectations)
+            throws DependencyException, InvalidStateException, ProvisionedThroughputException {
+        ensureInitialized();
+        return getLockTableDelegate().updateCoordinatorStateWithExpectation(state, expectations);
     }
 
     /**
@@ -381,19 +438,6 @@ public class CoordinatorStateDAO {
     }
 
     /**
-     * Whether coordinator-state writes go to the same table as the leader lock returned by
-     * {@link #getDDBLockClient()}. Writes are routed by the status cached at initialization, while the lock client
-     * follows the live status, so they diverge during PENDING and for a worker that initialized before the status
-     * changed (e.g. initialized in DEPLOYED, still running after COMPLETE). Writes that must land on the lock item,
-     * such as the fleet segmenting version heartbeat, are only safe while this is true.
-     */
-    public boolean isWriteRoutingAlignedWithLockClient() {
-        final boolean writesToLeaseTable = cachedStatus == TableMigrationStatus.TABLE_MIGRATION_STATUS_COMPLETE
-                || cachedStatus == TableMigrationStatus.TABLE_MIGRATION_STATUS_PENDING;
-        return writesToLeaseTable == isTableMigrationComplete();
-    }
-
-    /**
      * Shutdown both lock clients, closing their background heartbeat threads.
      * Should be called during scheduler shutdown to ensure no background threads
      * remain running.
@@ -452,6 +496,11 @@ public class CoordinatorStateDAO {
     private boolean isTableMigrationComplete() {
         return tableMigrationStatusProvider.getTableMigrationStatus()
                 == TableMigrationStatus.TABLE_MIGRATION_STATUS_COMPLETE;
+    }
+
+    /** The delegate for the table that holds the leader locks, matching {@link #getDDBLockClient()}. */
+    private CoordinatorStateDAODelegate getLockTableDelegate() {
+        return isTableMigrationComplete() ? leaseTableDaoDelegate : legacyTableDaoDelegate;
     }
 
     private CoordinatorStateDAODelegate getWriteDelegate() {

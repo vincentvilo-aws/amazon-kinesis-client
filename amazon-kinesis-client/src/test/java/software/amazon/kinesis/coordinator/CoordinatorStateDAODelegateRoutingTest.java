@@ -291,53 +291,199 @@ class CoordinatorStateDAODelegateRoutingTest {
         }
     }
 
-    // ---------------- isWriteRoutingAlignedWithLockClient ----------------
+    // ---------------- create without duplicates ----------------
 
-    /**
-     * Writes are routed by the status cached at initialize(); the lock client follows the live status. They agree in
-     * INIT/DEPLOYED (both legacy) and COMPLETE (both lease table), and disagree in PENDING and for a worker that
-     * initialized before the status changed to COMPLETE.
-     */
+    /** Before COMPLETE an entry that already exists in the other table is not created again. */
     @Test
-    void isWriteRoutingAlignedWithLockClient_matchesCachedAndLiveStatus() throws Exception {
-        assertAligned(
+    void createCoordinatorState_beforeComplete_skipsWhenInOtherTable() throws Exception {
+        when(statusProvider.getTableMigrationStatus()).thenReturn(TableMigrationStatus.TABLE_MIGRATION_STATUS_INIT);
+        final CoordinatorStateDAO dao = initializedDao();
+        putItem(LEASE_TABLE, "leaseKey", "dup-in-lease", streamInfoType());
+
+        assertFalse(dao.createCoordinatorStateIfNotExists(streamInfoState("dup-in-lease")));
+        assertTrue(isEmpty(getItem(LEGACY_TABLE, PK, "dup-in-lease")));
+    }
+
+    @Test
+    void createCoordinatorState_pending_skipsWhenInLegacy() throws Exception {
+        when(statusProvider.getTableMigrationStatus()).thenReturn(TableMigrationStatus.TABLE_MIGRATION_STATUS_PENDING);
+        final CoordinatorStateDAO dao = initializedDao();
+        putItem(LEGACY_TABLE, PK, "dup-in-legacy", streamInfoType());
+
+        assertFalse(dao.createCoordinatorStateIfNotExists(streamInfoState("dup-in-legacy")));
+        assertTrue(isEmpty(getItem(LEASE_TABLE, "leaseKey", "dup-in-legacy")));
+    }
+
+    /** COMPLETE is terminal: a worker that initialized earlier creates in the lease table, where reads look. */
+    @Test
+    void createCoordinatorState_initializedInDeployed_liveComplete_writesToLeaseTable() throws Exception {
+        when(statusProvider.getTableMigrationStatus()).thenReturn(TableMigrationStatus.TABLE_MIGRATION_STATUS_DEPLOYED);
+        final CoordinatorStateDAO dao = initializedDao();
+        when(statusProvider.getTableMigrationStatus()).thenReturn(TableMigrationStatus.TABLE_MIGRATION_STATUS_COMPLETE);
+
+        assertTrue(dao.createCoordinatorStateIfNotExists(streamInfoState("create-after-complete")));
+        assertFalse(isEmpty(getItem(LEASE_TABLE, "leaseKey", "create-after-complete")));
+        assertTrue(isEmpty(getItem(LEGACY_TABLE, PK, "create-after-complete")));
+    }
+
+    // ---------------- update where the entry lives ----------------
+
+    /** A phase 2 worker (writes go to the lease table) updates an entry that is still in legacy. */
+    @Test
+    void updateCoordinatorState_pending_updatesEntryInLegacy() throws Exception {
+        when(statusProvider.getTableMigrationStatus()).thenReturn(TableMigrationStatus.TABLE_MIGRATION_STATUS_PENDING);
+        final CoordinatorStateDAO dao = initializedDao();
+        putItem(LEGACY_TABLE, PK, "update-in-legacy", Collections.singletonMap("v", AttributeValue.fromS("old")));
+
+        assertTrue(dao.updateCoordinatorStateWithExpectation(stateWithValue("update-in-legacy", "new"), null));
+        assertEquals(
+                "new", getItem(LEGACY_TABLE, PK, "update-in-legacy").get("v").s());
+        assertTrue(isEmpty(getItem(LEASE_TABLE, "leaseKey", "update-in-legacy")));
+    }
+
+    /** A phase 1 worker (writes go to legacy) updates an entry that the migration already moved. */
+    @Test
+    void updateCoordinatorState_deployed_updatesEntryInLeaseTable() throws Exception {
+        when(statusProvider.getTableMigrationStatus()).thenReturn(TableMigrationStatus.TABLE_MIGRATION_STATUS_DEPLOYED);
+        final CoordinatorStateDAO dao = initializedDao();
+        putItem(LEASE_TABLE, "leaseKey", "update-in-lease", Collections.singletonMap("v", AttributeValue.fromS("old")));
+
+        assertTrue(dao.updateCoordinatorStateWithExpectation(stateWithValue("update-in-lease", "new"), null));
+        assertEquals(
+                "new",
+                getItem(LEASE_TABLE, "leaseKey", "update-in-lease").get("v").s());
+        assertTrue(isEmpty(getItem(LEGACY_TABLE, PK, "update-in-lease")));
+    }
+
+    /** A failed expectation on the legacy copy does not fall through to the lease table. */
+    @Test
+    void updateCoordinatorState_expectationFailsInLegacy_doesNotUpdateLeaseTable() throws Exception {
+        when(statusProvider.getTableMigrationStatus()).thenReturn(TableMigrationStatus.TABLE_MIGRATION_STATUS_INIT);
+        final CoordinatorStateDAO dao = initializedDao();
+        putItem(LEGACY_TABLE, PK, "both-tables", Collections.singletonMap("v", AttributeValue.fromS("legacy")));
+        putItem(LEASE_TABLE, "leaseKey", "both-tables", Collections.singletonMap("v", AttributeValue.fromS("lease")));
+
+        assertFalse(dao.updateCoordinatorStateWithExpectation(
+                stateWithValue("both-tables", "new"), expectValue("v", "something-else")));
+        assertEquals("legacy", getItem(LEGACY_TABLE, PK, "both-tables").get("v").s());
+        assertEquals(
+                "lease",
+                getItem(LEASE_TABLE, "leaseKey", "both-tables").get("v").s());
+    }
+
+    @Test
+    void updateCoordinatorState_missingFromBothTables_returnsFalse() throws Exception {
+        when(statusProvider.getTableMigrationStatus()).thenReturn(TableMigrationStatus.TABLE_MIGRATION_STATUS_INIT);
+        final CoordinatorStateDAO dao = initializedDao();
+
+        assertFalse(dao.updateCoordinatorStateWithExpectation(stateWithValue("missing-everywhere", "new"), null));
+    }
+
+    @Test
+    void updateCoordinatorState_complete_updatesLeaseTableOnly() throws Exception {
+        when(statusProvider.getTableMigrationStatus()).thenReturn(TableMigrationStatus.TABLE_MIGRATION_STATUS_COMPLETE);
+        final CoordinatorStateDAO dao = initializedDao();
+        putItem(LEGACY_TABLE, PK, "complete-update", Collections.singletonMap("v", AttributeValue.fromS("legacy")));
+
+        assertFalse(dao.updateCoordinatorStateWithExpectation(stateWithValue("complete-update", "new"), null));
+        assertEquals(
+                "legacy", getItem(LEGACY_TABLE, PK, "complete-update").get("v").s());
+    }
+
+    // ---------------- writes in the lock table (live status) ----------------
+
+    /** Lock-table writes follow the live status like the lock client: legacy before COMPLETE, lease table after. */
+    @Test
+    void lockTableWrites_followLiveStatus() throws Exception {
+        assertLockTableWrite(
                 TableMigrationStatus.TABLE_MIGRATION_STATUS_INIT,
                 TableMigrationStatus.TABLE_MIGRATION_STATUS_INIT,
-                true);
-        assertAligned(
-                TableMigrationStatus.TABLE_MIGRATION_STATUS_DEPLOYED,
-                TableMigrationStatus.TABLE_MIGRATION_STATUS_DEPLOYED,
-                true);
-        assertAligned(
-                TableMigrationStatus.TABLE_MIGRATION_STATUS_COMPLETE,
-                TableMigrationStatus.TABLE_MIGRATION_STATUS_COMPLETE,
-                true);
-        assertAligned(
-                TableMigrationStatus.TABLE_MIGRATION_STATUS_PENDING,
-                TableMigrationStatus.TABLE_MIGRATION_STATUS_PENDING,
+                "lock-init",
                 false);
-        // Initialized in DEPLOYED, still running after the table went COMPLETE.
-        assertAligned(
+        assertLockTableWrite(
+                TableMigrationStatus.TABLE_MIGRATION_STATUS_DEPLOYED,
+                TableMigrationStatus.TABLE_MIGRATION_STATUS_DEPLOYED,
+                "lock-deployed",
+                false);
+        // Phase 2 worker: other writes go to the lease table, but the lock is still in legacy.
+        assertLockTableWrite(
+                TableMigrationStatus.TABLE_MIGRATION_STATUS_PENDING,
+                TableMigrationStatus.TABLE_MIGRATION_STATUS_PENDING,
+                "lock-pending",
+                false);
+        // Initialized in DEPLOYED, still running after COMPLETE: the lock is now in the lease table.
+        assertLockTableWrite(
                 TableMigrationStatus.TABLE_MIGRATION_STATUS_DEPLOYED,
                 TableMigrationStatus.TABLE_MIGRATION_STATUS_COMPLETE,
-                false);
-        // Initialized in PENDING, still running after COMPLETE: both now use the lease table.
-        assertAligned(
-                TableMigrationStatus.TABLE_MIGRATION_STATUS_PENDING,
+                "lock-deployed-then-complete",
+                true);
+        assertLockTableWrite(
                 TableMigrationStatus.TABLE_MIGRATION_STATUS_COMPLETE,
+                TableMigrationStatus.TABLE_MIGRATION_STATUS_COMPLETE,
+                "lock-complete",
                 true);
     }
 
-    private void assertAligned(
-            final TableMigrationStatus atInitialize, final TableMigrationStatus live, final boolean expected)
+    private void assertLockTableWrite(
+            final TableMigrationStatus atInitialize,
+            final TableMigrationStatus live,
+            final String key,
+            final boolean expectLeaseTable)
             throws Exception {
         when(statusProvider.getTableMigrationStatus()).thenReturn(atInitialize);
+        final CoordinatorStateDAO dao = initializedDao();
+        when(statusProvider.getTableMigrationStatus()).thenReturn(live);
+
+        assertTrue(dao.createCoordinatorStateIfNotExistsInLockTable(stateWithValue(key, "created")), key);
+        assertTrue(dao.updateCoordinatorStateWithExpectationInLockTable(stateWithValue(key, "updated"), null), key);
+
+        final Map<String, AttributeValue> inLease = getItem(LEASE_TABLE, "leaseKey", key);
+        final Map<String, AttributeValue> inLegacy = getItem(LEGACY_TABLE, PK, key);
+        if (expectLeaseTable) {
+            assertEquals("updated", inLease.get("v").s(), key);
+            assertTrue(isEmpty(inLegacy), key);
+        } else {
+            assertEquals("updated", inLegacy.get("v").s(), key);
+            assertTrue(isEmpty(inLease), key);
+        }
+    }
+
+    private CoordinatorStateDAO initializedDao() throws Exception {
         final CoordinatorStateDAO dao = createDao();
         dao.initializeDelegates();
         dao.initialize();
-        when(statusProvider.getTableMigrationStatus()).thenReturn(live);
+        return dao;
+    }
 
-        org.junit.jupiter.api.Assertions.assertEquals(
-                expected, dao.isWriteRoutingAlignedWithLockClient(), atInitialize + " -> " + live);
+    private static Map<String, AttributeValue> streamInfoType() {
+        return Collections.singletonMap(
+                "entityType", AttributeValue.fromS(EntityType.CoordinatorStateType.STREAM_INFO.getDdbValue()));
+    }
+
+    private static CoordinatorState streamInfoState(final String key) {
+        return CoordinatorState.builder()
+                .key(key)
+                .coordinatorStateEntityType(EntityType.CoordinatorStateType.STREAM_INFO)
+                .build();
+    }
+
+    private static CoordinatorState stateWithValue(final String key, final String value) {
+        return CoordinatorState.builder()
+                .key(key)
+                .attributes(new HashMap<>(Collections.singletonMap("v", AttributeValue.fromS(value))))
+                .build();
+    }
+
+    private static Map<String, software.amazon.awssdk.services.dynamodb.model.ExpectedAttributeValue> expectValue(
+            final String name, final String value) {
+        return new HashMap<>(Collections.singletonMap(
+                name,
+                software.amazon.awssdk.services.dynamodb.model.ExpectedAttributeValue.builder()
+                        .value(AttributeValue.fromS(value))
+                        .build()));
+    }
+
+    private static boolean isEmpty(final Map<String, AttributeValue> item) {
+        return item == null || item.isEmpty();
     }
 }

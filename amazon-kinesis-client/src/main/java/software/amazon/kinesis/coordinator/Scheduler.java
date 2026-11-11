@@ -740,14 +740,13 @@ public class Scheduler implements Runnable {
      * <ul>
      *   <li>INIT / DEPLOYED (phase 1, or an app that stays on the legacy coordinator table): no entries are moved,
      *   and the lock and coordinator writes both use the legacy table. Allowed.</li>
-     *   <li>PENDING (phase 2): coordinator entries are moved between tables, and the lock (legacy table) and
-     *   coordinator writes (lease table) use different tables. Not allowed.</li>
+     *   <li>PENDING (phase 2): coordinator entries are moved between tables. Not allowed.</li>
      *   <li>COMPLETE: everything uses the lease table. Allowed.</li>
      *   <li>UNKNOWN: status not determined yet. Not allowed.</li>
      * </ul>
-     * It also requires the coordinator-state write table to match the lock table, which isn't the case for a worker
-     * that initialized before the status changed. Throws if the migration state machine isn't initialized yet, which
-     * the segmenting handler treats as "not allowed".
+     * The leader version items are written to the lock's table using the live status, so a worker that initialized
+     * before the status changed (e.g. in DEPLOYED, still running after COMPLETE) keeps segmenting. Throws if the
+     * migration state machine isn't initialized yet, which the segmenting handler treats as "not allowed".
      */
     @VisibleForTesting
     boolean isFleetSegmentingAllowed() {
@@ -758,7 +757,7 @@ public class Scheduler implements Runnable {
             case TABLE_MIGRATION_STATUS_INIT:
             case TABLE_MIGRATION_STATUS_DEPLOYED:
             case TABLE_MIGRATION_STATUS_COMPLETE:
-                return coordinatorStateDAO.isWriteRoutingAlignedWithLockClient();
+                return true;
             default:
                 return false;
         }

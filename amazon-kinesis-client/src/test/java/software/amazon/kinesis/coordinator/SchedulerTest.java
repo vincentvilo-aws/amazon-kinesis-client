@@ -1744,11 +1744,8 @@ public class SchedulerTest {
         final MigrationStateMachine stateMachine = mock(MigrationStateMachine.class);
         when(stateMachine.getCurrentClientVersion()).thenReturn(ClientVersion.CLIENT_VERSION_3X);
         final TableMigrationStatusProvider provider = mock(TableMigrationStatusProvider.class);
-        final CoordinatorStateDAO dao = mock(CoordinatorStateDAO.class);
-        when(dao.isWriteRoutingAlignedWithLockClient()).thenReturn(true);
         setSchedulerFieldToAccessible("migrationStateMachine", stateMachine);
         setSchedulerFieldToAccessible("tableMigrationStatusProvider", provider);
-        setSchedulerFieldToAccessible("coordinatorStateDAO", dao);
 
         for (final TableMigrationStatus status : TableMigrationStatus.values()) {
             when(provider.getTableMigrationStatus()).thenReturn(status);
@@ -1757,11 +1754,6 @@ public class SchedulerTest {
                     || status == TableMigrationStatus.TABLE_MIGRATION_STATUS_COMPLETE;
             assertEquals(status.toString(), expected, scheduler.isFleetSegmentingAllowed());
         }
-
-        // Write routing out of step with the lock table (worker initialized before the status changed).
-        when(provider.getTableMigrationStatus()).thenReturn(TableMigrationStatus.TABLE_MIGRATION_STATUS_COMPLETE);
-        when(dao.isWriteRoutingAlignedWithLockClient()).thenReturn(false);
-        assertFalse(scheduler.isFleetSegmentingAllowed());
 
         // Not in client version 3X.
         when(stateMachine.getCurrentClientVersion()).thenReturn(ClientVersion.CLIENT_VERSION_3X_WITH_ROLLBACK);

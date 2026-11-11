@@ -246,18 +246,22 @@ public class LeaderVersionDAO {
                 && workerId.equals(lock.get().getOwnerName());
     }
 
-    /** Writes the whole item: update if it exists, otherwise create it. */
+    /**
+     * Writes the whole item: update if it exists, otherwise create it. Writes go to the table that holds the leader
+     * locks (following the live table migration status), so the item always sits next to its lock and is found by
+     * readers in every phase.
+     */
     private void writeVersionState(final String lockKey)
             throws ProvisionedThroughputException, InvalidStateException, DependencyException {
         final LeaderVersionState state = newState(lockKey);
-        if (coordinatorStateDAO.updateCoordinatorStateWithExpectation(state, null)) {
+        if (coordinatorStateDAO.updateCoordinatorStateWithExpectationInLockTable(state, null)) {
             return;
         }
-        if (coordinatorStateDAO.createCoordinatorStateIfNotExists(state)) {
+        if (coordinatorStateDAO.createCoordinatorStateIfNotExistsInLockTable(state)) {
             return;
         }
         // Created between the two calls; it exists now, so update it.
-        if (!coordinatorStateDAO.updateCoordinatorStateWithExpectation(state, null)) {
+        if (!coordinatorStateDAO.updateCoordinatorStateWithExpectationInLockTable(state, null)) {
             throw new DependencyException(
                     "Unable to write leader version item for " + lockKey, new IllegalStateException());
         }
@@ -277,7 +281,7 @@ public class LeaderVersionDAO {
                 ExpectedAttributeValue.builder()
                         .value(AttributeValue.fromS(versionHash))
                         .build());
-        return coordinatorStateDAO.updateCoordinatorStateWithExpectation(newState(lockKey), expectations);
+        return coordinatorStateDAO.updateCoordinatorStateWithExpectationInLockTable(newState(lockKey), expectations);
     }
 
     private LeaderVersionState newState(final String lockKey) {
